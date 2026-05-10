@@ -242,6 +242,8 @@ static void waterCheck() {
 static void startAP() {
   char apName[32];
   snprintf(apName, sizeof(apName), "%s-%04X", AP_PREFIX, (uint16_t)ESP.getChipId());
+  WiFi.forceSleepWake();
+  delay(1);
   WiFi.mode(WIFI_AP);
   WiFi.setOutputPower(AP_TX_POWER);
   WiFi.softAP(apName, AP_PASSWORD);
@@ -258,6 +260,8 @@ static void startAP() {
 static void staConnect() {
   if (g_wifiActive || strlen(g_ssid) == 0) return;
   Serial.printf("[wifi] Connecting to '%s'...\n", g_ssid);
+  WiFi.forceSleepWake();
+  delay(1);
   WiFi.mode(WIFI_STA);
   WiFi.setSleepMode(WIFI_LIGHT_SLEEP);
   WiFi.config(STA_IP, STA_GW, STA_SUBNET);
@@ -282,7 +286,7 @@ static void wifiOff() {
   if (!g_wifiActive) return;
   g_srv.stop();
   WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
+  WiFi.forceSleepBegin();   // CPU ngủ trong delay() khi idle → ~0.9mA
   g_wifiActive = false;
   g_apMode     = false;
   Serial.println("[wifi] Off");
