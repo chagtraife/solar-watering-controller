@@ -535,6 +535,7 @@ static void handleSyncTime() {
 }
 
 static void handleRoot() {
+  g_srv.sendHeader("Cache-Control", "no-cache, no-store");
   g_srv.send(200, "text/html; charset=utf-8", buildPage());
 }
 
