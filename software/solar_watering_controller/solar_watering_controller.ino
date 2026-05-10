@@ -3,19 +3,15 @@
  *
  * Wiring:
  *   D0 (GPIO16) → Relay IN (active-HIGH) → Van điện từ
+ *   A0 để trống (dùng đo Vcc nội bộ để phát hiện mất điện)
  *
- * Power: WiFi Light Sleep (~1-2mA idle) — phù hợp với solar + pin sạc
+ * WiFi:  Boot lần đầu (chưa có SSID) → AP "SolarWater-XXXX" / 192.168.4.1
+ *        Đã cấu hình SSID → thử kết nối STA, retry mỗi 5 phút
  * Time:  User tự set giờ qua Web UI (không cần internet)
- *        Giờ lưu EEPROM khi phát hiện điện sụt + backup mỗi 6 giờ
- *        A0 phải để trống (dùng đo Vcc nội bộ để phát hiện mất điện)
+ *        Lưu EEPROM khi Vcc sụt + backup mỗi 6 giờ
  *
  * Board: Generic ESP8266 Module
  * Core:  ESP8266 Arduino Core (Board Manager)
- *
- * Lần đầu cấu hình:
- *   1. Kết nối WiFi "SolarWater-XXXX"  password: 12345678
- *   2. Mở trình duyệt → 192.168.4.1
- *   3. Nhập WiFi nhà + set giờ + lịch tưới → Lưu
  */
 
 // Đặt trước mọi #include — chuyển ADC sang đo Vcc nội bộ (A0 để trống)
@@ -27,7 +23,7 @@ ADC_MODE(ADC_VCC);
 #include <time.h>
 
 // ── Pin ───────────────────────────────────────────────────────────────────────
-#define VALVE_PIN  16   // GPIO16 = D0, active-LOW relay
+#define VALVE_PIN  16   // GPIO16 = D0, active-HIGH relay
 
 // ── EEPROM ────────────────────────────────────────────────────────────────────
 #define EEPROM_SIZE  256
@@ -43,15 +39,16 @@ ADC_MODE(ADC_VCC);
 #define AP_PREFIX        "SolarWater"
 #define AP_PASSWORD      "12345678"
 
-// WiFi chỉ bật trong khung giờ 8:00–16:00
-#define AP_HOUR_START    8
-#define AP_HOUR_END     16
-#define AP_TX_POWER      0     // 0dBm — tầm phủ ~1-2m, tiết kiệm điện nhất
+#define AP_TX_POWER      0     // 0dBm — tầm phủ ~1-2m khi setup lần đầu
 #define AP_BEACON_MS   500     // beacon interval AP (ms)
 
-#define WIFI_TIMEOUT_MS  15000UL
-#define WIFI_ON_MS       (1UL  * 60 * 1000)   // Bật WiFi 1 phút
-#define WIFI_OFF_MS      (5UL  * 60 * 1000)   // Tắt WiFi 5 phút
+#define WIFI_TIMEOUT_MS  30000UL
+#define WIFI_RETRY_MS    (5UL * 60 * 1000)    // Thử kết nối STA mỗi 5 phút
+
+// IP tĩnh khi kết nối hotspot — đổi theo subnet thực tế (xem Serial lúc DHCP)
+static const IPAddress STA_IP     ( 10, 143, 117, 200);
+static const IPAddress STA_GW     ( 10, 143, 117,   1);
+static const IPAddress STA_SUBNET (255, 255, 255,   0);
 #define SCHED_CHECK_MS   10000UL               // Kiểm tra lịch mỗi 10 giây
 #define SCHED_WINDOW_SEC   60                  // Tưới khi sai lệch ≤60s
 
@@ -87,6 +84,7 @@ uint32_t g_lastCheck      = 0;
 uint32_t g_lastTimeSave   = 0;   // Backup 6 giờ/lần
 uint32_t g_lastVccCheck   = 0;
 uint32_t g_wifiCycleAt    = 0;   // Thời điểm bắt đầu phase hiện tại (on/off)
+uint32_t g_reconnectAt    = 0;   // Thời điểm bắt đầu reconnect (0 = không reconnect)
 bool     g_wateredThisCycle = false;
 
 // ── Thời gian ─────────────────────────────────────────────────────────────────
@@ -177,6 +175,16 @@ static bool dayMatches(const struct tm &t) {
   return (g_sched.days >> t.tm_wday) & 1;
 }
 
+static bool wateringSoon() {
+  if (!g_sched.enabled || !timeValid() || g_watering) return g_watering;
+  time_t n = nowTs();
+  struct tm t = *localtime(&n);
+  int nowSec   = t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec;
+  int schedSec = g_sched.hour * 3600 + g_sched.minute * 60;
+  int diff     = schedSec - nowSec;
+  return diff >= 0 && diff <= (int)(WIFI_TIMEOUT_MS / 1000);
+}
+
 static bool isWateringTime() {
   if (!timeValid()) return false;
   time_t n = nowTs();
@@ -231,57 +239,49 @@ static void waterCheck() {
 }
 
 // ── WiFi ──────────────────────────────────────────────────────────────────────
-static bool isApWindow() {
-  if (!timeValid()) return true;   // Chưa có giờ → bật để user set
-  time_t n = nowTs();
-  struct tm t = *localtime(&n);
-  return t.tm_hour >= AP_HOUR_START && t.tm_hour < AP_HOUR_END;
-}
-
-static void wifiOn() {
-  if (g_wifiActive) return;
-
-  // Thử STA trước nếu có SSID
-  if (strlen(g_ssid) > 0) {
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleepMode(WIFI_LIGHT_SLEEP);
-    WiFi.begin(g_ssid, g_pass);
-    uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED) {
-      if (millis() - t0 > WIFI_TIMEOUT_MS) break;
-      delay(250);
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      g_wifiActive = true;
-      g_apMode     = false;
-      g_srv.begin();
-      Serial.println("[wifi] STA: " + WiFi.localIP().toString());
-      return;
-    }
-    WiFi.disconnect(true);
-  }
-
-  // Fallback: AP mode với công suất thấp
+static void startAP() {
   char apName[32];
   snprintf(apName, sizeof(apName), "%s-%04X", AP_PREFIX, (uint16_t)ESP.getChipId());
   WiFi.mode(WIFI_AP);
   WiFi.setOutputPower(AP_TX_POWER);
   WiFi.softAP(apName, AP_PASSWORD);
-
   struct softap_config cfg;
   wifi_softap_get_config(&cfg);
   cfg.beacon_interval = AP_BEACON_MS;
   wifi_softap_set_config(&cfg);
-
   g_wifiActive = true;
   g_apMode     = true;
   g_srv.begin();
   Serial.printf("[wifi] AP: %s  IP: 192.168.4.1\n", apName);
 }
 
+static void staConnect() {
+  if (g_wifiActive || strlen(g_ssid) == 0) return;
+  Serial.printf("[wifi] Connecting to '%s'...\n", g_ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleepMode(WIFI_LIGHT_SLEEP);
+  WiFi.config(STA_IP, STA_GW, STA_SUBNET);
+  WiFi.begin(g_ssid, g_pass);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - t0 > WIFI_TIMEOUT_MS) {
+      Serial.printf("[wifi] STA failed (status=%d)\n", WiFi.status());
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      return;
+    }
+    delay(250);
+  }
+  g_wifiActive = true;
+  g_apMode     = false;
+  g_srv.begin();
+  Serial.println("[wifi] STA: " + WiFi.localIP().toString());
+}
+
 static void wifiOff() {
   if (!g_wifiActive) return;
   g_srv.stop();
+  WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   g_wifiActive = false;
   g_apMode     = false;
@@ -294,7 +294,7 @@ static const char HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="30">
+<link rel="icon" href="data:,">
 <title>Solar Watering</title>
 <style>
 *{box-sizing:border-box}
@@ -641,7 +641,8 @@ static void handleReset() {
 }
 
 static void handleNotFound() {
-  g_srv.sendHeader("Location", "http://192.168.4.1/");
+  Serial.println("[http] 404: " + g_srv.uri());
+  g_srv.sendHeader("Location", "/");
   g_srv.send(302);
 }
 
@@ -671,7 +672,12 @@ void setup() {
   g_srv.on("/reset",   HTTP_POST, handleReset);
   g_srv.onNotFound(handleNotFound);
 
-  if (isApWindow()) wifiOn();
+  // Lần đầu chưa có SSID → AP để cấu hình; đã có → thử STA ngay
+  if (strlen(g_ssid) == 0) {
+    startAP();
+  } else {
+    staConnect();
+  }
   Serial.println("[boot] Ready");
 }
 
@@ -714,26 +720,24 @@ void loop() {
     }
   }
 
-  // 3. WiFi duty cycle: 1 phút bật / 5 phút tắt, chỉ trong 8:00–16:00
-  if (!isApWindow()) {
-    // Ngoài khung giờ → tắt hẳn
-    if (g_wifiActive) { wifiOff(); g_wifiCycleAt = now_ms; }
-  } else if (!g_wifiActive) {
-    // Đang tắt → bật sau WIFI_OFF_MS
-    if (now_ms - g_wifiCycleAt >= WIFI_OFF_MS) {
-      wifiOn();
-      g_wifiCycleAt = now_ms;
-    }
-  } else {
-    // Đang bật → sau WIFI_ON_MS kiểm tra có client không
-    if (now_ms - g_wifiCycleAt >= WIFI_ON_MS) {
-      bool hasClient = g_apMode ? (WiFi.softAPgetStationNum() > 0) : false;
-      if (hasClient) {
-        g_wifiCycleAt = now_ms;   // Gia hạn thêm 1 phút
-      } else {
+  // 3. STA: giữ kết nối, reconnect ngay khi mất, retry mỗi 5 phút nếu fail
+  if (!g_apMode) {
+    if (g_wifiActive && WiFi.status() != WL_CONNECTED) {
+      if (g_reconnectAt == 0) {
+        g_reconnectAt = now_ms;
+        WiFi.reconnect();
+        Serial.println("[wifi] Lost, reconnecting...");
+      } else if (now_ms - g_reconnectAt >= WIFI_TIMEOUT_MS) {
+        g_reconnectAt = 0;
         wifiOff();
         g_wifiCycleAt = now_ms;
+        Serial.println("[wifi] Reconnect failed, retry in 5min");
       }
+    } else if (g_wifiActive) {
+      g_reconnectAt = 0;
+    } else if (!wateringSoon() && now_ms - g_wifiCycleAt >= WIFI_RETRY_MS) {
+      staConnect();
+      g_wifiCycleAt = now_ms;
     }
   }
 
