@@ -127,9 +127,22 @@ static void cfgSave() {
 // Lưu giờ hiện tại vào EEPROM (checkpoint để khôi phục sau mất điện)
 static void timeSave() {
   if (!timeValid()) return;
-  uint32_t ts = (uint32_t)nowTs();
+  static uint32_t lastSaved = 0;
+  time_t now = nowTs();
+
+  // Chỉ lưu khi khác ngày, giờ hoặc phút so với lần trước
+  if (lastSaved > 1609459200UL) {
+    struct tm tn = *localtime(&now);
+    time_t   ls  = (time_t)lastSaved;
+    struct tm tp = *localtime(&ls);
+    if (tn.tm_mday == tp.tm_mday &&
+        tn.tm_hour == tp.tm_hour &&
+        tn.tm_min  == tp.tm_min)  return;
+  }
+
+  lastSaved = (uint32_t)now;
   EEPROM.begin(EEPROM_SIZE);
-  EEPROM.put(ADDR_TIME, ts);
+  EEPROM.put(ADDR_TIME, lastSaved);
   EEPROM.commit();
 }
 
@@ -296,8 +309,11 @@ input[type=date],input[type=time],select{
 
 <!-- Set giờ -->
 <div class="card">
-  <h3>&#8987; Cài đặt thời gian</h3>
-  <p class="hint" style="margin:0 0 8px">Sau mất điện, giờ có thể lệch — hãy cập nhật lại.</p>
+  <h3>&#8987; Thời gian &amp; Múi giờ</h3>
+  <button class="btn btn-time" type="button" onclick="syncTime()" style="margin-top:0">
+    &#128241; Đồng bộ giờ từ thiết bị này
+  </button>
+  <p class="hint" style="margin:6px 0 8px">Hoặc nhập thủ công bên dưới:</p>
   <form method="post" action="/settime">
     <div class="row">
       <div>
@@ -371,14 +387,25 @@ input[type=date],input[type=time],select{
 
 <script>
 function toggleDays(v){
-  document.getElementById('daysRow').style.display = v=='1'?'flex':'none';
+  document.getElementById('daysRow').style.display=v=='1'?'flex':'none';
 }
-// Đồng hồ real-time — khởi tạo từ giờ server, tăng mỗi giây
-%CLOCK_INIT%
+// Đồng hồ chạy từ giờ thiết bị
+var y,mo,d,h,m,s;
+(function(){
+  var now=new Date();
+  y=now.getFullYear();mo=now.getMonth()+1;d=now.getDate();
+  h=now.getHours();m=now.getMinutes();s=now.getSeconds();
+})();
+function syncTime(){
+  var ts=Math.floor(new Date().getTime()/1000);
+  fetch('/synctime?ts='+ts)
+    .then(function(){alert('Đã đồng bộ giờ!');location.reload();})
+    .catch(function(){alert('Lỗi đồng bộ!');});
+}
 function pad(n){return('0'+n).slice(-2)}
 function tick(){
-  if(!clkEl) return;
-  s++; if(s>=60){s=0;m++;} if(m>=60){m=0;h++;} if(h>=24){h=0;}
+  if(!clkEl)return;
+  s++;if(s>=60){s=0;m++;}if(m>=60){m=0;h++;}if(h>=24){h=0;}
   clkEl.textContent=pad(d)+'/'+pad(mo)+'/'+y+' '+pad(h)+':'+pad(m)+':'+pad(s);
 }
 var clkEl=document.getElementById('clk');
@@ -396,19 +423,7 @@ static String buildPage() {
     "<div class='warn'>&#9888; <b>Chưa có thời gian!</b> "
     "Vui lòng cập nhật giờ bên dưới để lịch tưới hoạt động.</div>");
 
-  if (timeValid()) {
-    struct tm *lt = localtime(&n);
-    char jsInit[80];
-    snprintf(jsInit, sizeof(jsInit),
-      "var y=%d,mo=%d,d=%d,h=%d,m=%d,s=%d;",
-      lt->tm_year + 1900, lt->tm_mon + 1, lt->tm_mday,
-      lt->tm_hour, lt->tm_min, lt->tm_sec);
-    html.replace("%TIME%",      fmtTime(n));
-    html.replace("%CLOCK_INIT%", jsInit);
-  } else {
-    html.replace("%TIME%",      "<b style='color:#e65100'>Chưa set</b>");
-    html.replace("%CLOCK_INIT%", "var y=0,mo=0,d=0,h=0,m=0,s=0;");
-  }
+  html.replace("%TIME%", timeValid() ? fmtTime(n) : "Đang đồng bộ...");
   html.replace("%NEXT%", nextWaterStr());
 
   // Valve status
@@ -465,6 +480,19 @@ static String buildPage() {
 }
 
 // ── HTTP Handlers ─────────────────────────────────────────────────────────────
+static void handleSyncTime() {
+  if (g_srv.hasArg("ts")) {
+    time_t ts = (time_t)g_srv.arg("ts").toInt();
+    if (ts > 1609459200UL) {
+      timeval tv = {ts, 0};
+      settimeofday(&tv, nullptr);
+      timeSave();
+      Serial.println("[time] Sync từ browser: " + fmtTime(nowTs()));
+    }
+  }
+  g_srv.send(200, "text/plain", "ok");
+}
+
 static void handleRoot() {
   g_srv.send(200, "text/html; charset=utf-8", buildPage());
 }
@@ -588,8 +616,9 @@ void setup() {
     startAP();
   }
 
-  g_srv.on("/",        HTTP_GET,  handleRoot);
-  g_srv.on("/settime", HTTP_POST, handleSetTime);
+  g_srv.on("/",         HTTP_GET,  handleRoot);
+  g_srv.on("/synctime", HTTP_GET,  handleSyncTime);
+  g_srv.on("/settime",  HTTP_POST, handleSetTime);
   g_srv.on("/save",    HTTP_POST, handleSave);
   g_srv.on("/water",   HTTP_POST, handleWater);
   g_srv.on("/stop",    HTTP_POST, handleStop);
