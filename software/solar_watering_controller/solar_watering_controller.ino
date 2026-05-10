@@ -2,7 +2,7 @@
  * Solar Watering Controller - ESP8266 (ESP-12 Module)
  *
  * Wiring:
- *   D0 (GPIO16) → Relay IN (active-LOW) → Van điện từ
+ *   D0 (GPIO16) → Relay IN (active-HIGH) → Van điện từ
  *
  * Power: WiFi Light Sleep (~1-2mA idle) — phù hợp với solar + pin sạc
  * Time:  User tự set giờ qua Web UI (không cần internet)
@@ -43,11 +43,16 @@ ADC_MODE(ADC_VCC);
 #define AP_PREFIX        "SolarWater"
 #define AP_PASSWORD      "12345678"
 
-#define WIFI_TIMEOUT_MS   15000UL
-#define SCHED_CHECK_MS   10000UL               // Kiểm tra lịch mỗi 10 giây
-#define SCHED_WINDOW_SEC    60                 // Tưới khi sai lệch ≤60s
-#define TIME_SAVE_MS     (30UL * 60 * 1000)   // Lưu giờ vào EEPROM mỗi 30 phút
-#define RECONNECT_MS     (60UL * 1000)         // Thử reconnect WiFi mỗi 1 phút
+// WiFi chỉ bật trong khung giờ 8:00–16:00
+#define AP_HOUR_START    8
+#define AP_HOUR_END     16
+#define AP_TX_POWER      0     // 0dBm — tầm phủ ~1-2m, tiết kiệm điện nhất
+#define AP_BEACON_MS   500     // beacon interval AP (ms)
+
+#define WIFI_TIMEOUT_MS 15000UL
+#define WIFI_CHECK_MS   (60UL * 1000)          // Kiểm tra cửa sổ WiFi mỗi 60s
+#define SCHED_CHECK_MS  10000UL                // Kiểm tra lịch mỗi 10 giây
+#define SCHED_WINDOW_SEC   60                  // Tưới khi sai lệch ≤60s
 
 // ── Phát hiện mất điện qua Vcc ───────────────────────────────────────────────
 #define VCC_CHECK_MS     1000UL    // Đo Vcc mỗi 1 giây
@@ -72,15 +77,15 @@ Schedule g_sched;
 
 ESP8266WebServer g_srv(80);
 
-bool     g_wifiOk     = false;
+bool     g_wifiActive = false;
 bool     g_apMode     = false;
 bool     g_watering   = false;
 uint32_t g_waterEnd   = 0;
 
-uint32_t g_lastCheck     = 0;
-uint32_t g_lastTimeSave  = 0;   // Backup 6 giờ/lần
-uint32_t g_lastVccCheck  = 0;
-uint32_t g_lastReconnect = 0;
+uint32_t g_lastCheck      = 0;
+uint32_t g_lastTimeSave   = 0;   // Backup 6 giờ/lần
+uint32_t g_lastVccCheck   = 0;
+uint32_t g_lastWifiCheck  = 0;
 bool     g_wateredThisCycle = false;
 
 // ── Thời gian ─────────────────────────────────────────────────────────────────
@@ -225,25 +230,61 @@ static void waterCheck() {
 }
 
 // ── WiFi ──────────────────────────────────────────────────────────────────────
-static bool wifiConnect() {
-  if (strlen(g_ssid) == 0) return false;
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleepMode(WIFI_LIGHT_SLEEP);
-  WiFi.begin(g_ssid, g_pass);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - t0 > WIFI_TIMEOUT_MS) return false;
-    delay(250);
-  }
-  return true;
+static bool isApWindow() {
+  if (!timeValid()) return true;   // Chưa có giờ → bật để user set
+  time_t n = nowTs();
+  struct tm t = *localtime(&n);
+  return t.tm_hour >= AP_HOUR_START && t.tm_hour < AP_HOUR_END;
 }
 
-static void startAP() {
-  WiFi.mode(WIFI_AP);
+static void wifiOn() {
+  if (g_wifiActive) return;
+
+  // Thử STA trước nếu có SSID
+  if (strlen(g_ssid) > 0) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleepMode(WIFI_LIGHT_SLEEP);
+    WiFi.begin(g_ssid, g_pass);
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+      if (millis() - t0 > WIFI_TIMEOUT_MS) break;
+      delay(250);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      g_wifiActive = true;
+      g_apMode     = false;
+      g_srv.begin();
+      Serial.println("[wifi] STA: " + WiFi.localIP().toString());
+      return;
+    }
+    WiFi.disconnect(true);
+  }
+
+  // Fallback: AP mode với công suất thấp
   char apName[32];
   snprintf(apName, sizeof(apName), "%s-%04X", AP_PREFIX, (uint16_t)ESP.getChipId());
+  WiFi.mode(WIFI_AP);
+  WiFi.setOutputPower(AP_TX_POWER);
   WiFi.softAP(apName, AP_PASSWORD);
+
+  struct softap_config cfg;
+  wifi_softap_get_config(&cfg);
+  cfg.beacon_interval = AP_BEACON_MS;
+  wifi_softap_set_config(&cfg);
+
+  g_wifiActive = true;
+  g_apMode     = true;
+  g_srv.begin();
   Serial.printf("[wifi] AP: %s  IP: 192.168.4.1\n", apName);
+}
+
+static void wifiOff() {
+  if (!g_wifiActive) return;
+  g_srv.stop();
+  WiFi.mode(WIFI_OFF);
+  g_wifiActive = false;
+  g_apMode     = false;
+  Serial.println("[wifi] Off");
 }
 
 // ── Web UI ────────────────────────────────────────────────────────────────────
@@ -445,9 +486,7 @@ static String buildPage() {
     snprintf(apName, sizeof(apName), "%s-%04X", AP_PREFIX, (uint16_t)ESP.getChipId());
     html.replace("%WIFI%", "AP — <b>" + String(apName) + "</b> / 192.168.4.1");
   } else {
-    html.replace("%WIFI%", WiFi.status() == WL_CONNECTED
-      ? "&#9989; <b>" + WiFi.localIP().toString() + "</b>"
-      : "&#10060; Đang kết nối...");
+    html.replace("%WIFI%", "&#9989; <b>" + WiFi.localIP().toString() + "</b>");
   }
 
   // Pre-fill date/time inputs với giờ hiện tại
@@ -608,14 +647,6 @@ void setup() {
   else
     Serial.println("[time] Chưa có giờ — cần set qua Web UI");
 
-  g_wifiOk = wifiConnect();
-  if (g_wifiOk) {
-    Serial.println("[wifi] " + WiFi.localIP().toString());
-  } else {
-    g_apMode = true;
-    startAP();
-  }
-
   g_srv.on("/",         HTTP_GET,  handleRoot);
   g_srv.on("/synctime", HTTP_GET,  handleSyncTime);
   g_srv.on("/settime",  HTTP_POST, handleSetTime);
@@ -624,13 +655,14 @@ void setup() {
   g_srv.on("/stop",    HTTP_POST, handleStop);
   g_srv.on("/reset",   HTTP_POST, handleReset);
   g_srv.onNotFound(handleNotFound);
-  g_srv.begin();
-  Serial.println("[http] Server ready");
+
+  if (isApWindow()) wifiOn();
+  Serial.println("[boot] Ready");
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
-  g_srv.handleClient();
+  if (g_wifiActive) g_srv.handleClient();
   waterCheck();
 
   uint32_t now_ms = millis();
@@ -667,12 +699,14 @@ void loop() {
     }
   }
 
-  // 3. Tự kết nối lại WiFi nếu mất
-  if (g_wifiOk && !g_apMode && WiFi.status() != WL_CONNECTED
-      && now_ms - g_lastReconnect >= RECONNECT_MS) {
-    g_lastReconnect = now_ms;
-    Serial.println("[wifi] Reconnect...");
-    WiFi.reconnect();
+  // 3. Bật/tắt WiFi theo khung giờ 8:00–16:00
+  if (now_ms - g_lastWifiCheck >= WIFI_CHECK_MS) {
+    g_lastWifiCheck = now_ms;
+    if (isApWindow()) {
+      wifiOn();
+    } else {
+      wifiOff();
+    }
   }
 
   delay(10);
