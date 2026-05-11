@@ -430,12 +430,14 @@ input[type=date],input[type=time],select{
 function toggleDays(v){
   document.getElementById('daysRow').style.display=v=='1'?'flex':'none';
 }
-// Đồng hồ chạy từ giờ thiết bị
+// Đồng hồ khởi tạo từ giờ device (parse chuỗi dd/mm/yyyy HH:MM:SS)
+var clkEl=document.getElementById('clk');
 var y,mo,d,h,m,s;
 (function(){
-  var now=new Date();
-  y=now.getFullYear();mo=now.getMonth()+1;d=now.getDate();
-  h=now.getHours();m=now.getMinutes();s=now.getSeconds();
+  var txt=clkEl?clkEl.textContent:'';
+  var r=txt.match(/(\d+)\/(\d+)\/(\d+) (\d+):(\d+):(\d+)/);
+  if(r){d=+r[1];mo=+r[2];y=+r[3];h=+r[4];m=+r[5];s=+r[6];}
+  else{var now=new Date();y=now.getFullYear();mo=now.getMonth()+1;d=now.getDate();h=now.getHours();m=now.getMinutes();s=now.getSeconds();}
 })();
 function syncTime(){
   var ts=Math.floor(new Date().getTime()/1000);
@@ -449,7 +451,6 @@ function tick(){
   s++;if(s>=60){s=0;m++;}if(m>=60){m=0;h++;}if(h>=24){h=0;}
   clkEl.textContent=pad(d)+'/'+pad(mo)+'/'+y+' '+pad(h)+':'+pad(m)+':'+pad(s);
 }
-var clkEl=document.getElementById('clk');
 setInterval(tick,1000);
 </script>
 </body>
@@ -564,10 +565,18 @@ static void handleSetTime() {
 }
 
 static void handleSave() {
+  char newSsid[64] = {};
+  char newPass[64] = {};
   if (g_srv.hasArg("ssid"))
-    strncpy(g_ssid, g_srv.arg("ssid").c_str(), sizeof(g_ssid) - 1);
+    strncpy(newSsid, g_srv.arg("ssid").c_str(), sizeof(newSsid) - 1);
   if (g_srv.arg("pass").length() > 0)
-    strncpy(g_pass, g_srv.arg("pass").c_str(), sizeof(g_pass) - 1);
+    strncpy(newPass, g_srv.arg("pass").c_str(), sizeof(newPass) - 1);
+
+  bool wifiChanged = (strcmp(newSsid, g_ssid) != 0)
+                  || (strlen(newPass) > 0 && strcmp(newPass, g_pass) != 0);
+
+  strncpy(g_ssid, newSsid, sizeof(g_ssid));
+  if (strlen(newPass) > 0) strncpy(g_pass, newPass, sizeof(g_pass));
 
   g_tz = (int8_t)constrain(g_srv.arg("tz").toInt(), -12, 14);
 
@@ -587,15 +596,20 @@ static void handleSave() {
   }
 
   cfgSave();
-  applyTimezone();   // Áp dụng múi giờ mới nếu thay đổi
+  applyTimezone();
 
-  g_srv.send(200, "text/html; charset=utf-8",
-    "<meta charset=UTF-8>"
-    "<p style='font-family:Arial;padding:20px;font-size:1.1em'>"
-    "&#10003; Đã lưu! Đang khởi động lại...</p>"
-    "<script>setTimeout(()=>location.href='/',3000)</script>");
-  delay(1500);
-  ESP.restart();
+  if (wifiChanged) {
+    g_srv.send(200, "text/html; charset=utf-8",
+      "<meta charset=UTF-8>"
+      "<p style='font-family:Arial;padding:20px;font-size:1.1em'>"
+      "&#10003; Đã lưu! Đang khởi động lại...</p>"
+      "<script>setTimeout(()=>location.href='/',3000)</script>");
+    delay(1500);
+    ESP.restart();
+  } else {
+    g_srv.sendHeader("Location", "/");
+    g_srv.send(302);
+  }
 }
 
 static void handleWater() {
