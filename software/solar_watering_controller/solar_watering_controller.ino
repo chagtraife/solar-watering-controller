@@ -49,9 +49,10 @@ ADC_MODE(ADC_VCC);
 #define AP_TX_POWER      0     // 0dBm — tầm phủ ~1-2m, tiết kiệm điện nhất
 #define AP_BEACON_MS   500     // beacon interval AP (ms)
 
-#define WIFI_TIMEOUT_MS 15000UL
-#define WIFI_CHECK_MS   (60UL * 1000)          // Kiểm tra cửa sổ WiFi mỗi 60s
-#define SCHED_CHECK_MS  10000UL                // Kiểm tra lịch mỗi 10 giây
+#define WIFI_TIMEOUT_MS  15000UL
+#define WIFI_ON_MS       (1UL  * 60 * 1000)   // Bật WiFi 1 phút
+#define WIFI_OFF_MS      (5UL  * 60 * 1000)   // Tắt WiFi 5 phút
+#define SCHED_CHECK_MS   10000UL               // Kiểm tra lịch mỗi 10 giây
 #define SCHED_WINDOW_SEC   60                  // Tưới khi sai lệch ≤60s
 
 // ── Phát hiện mất điện qua Vcc ───────────────────────────────────────────────
@@ -85,7 +86,7 @@ uint32_t g_waterEnd   = 0;
 uint32_t g_lastCheck      = 0;
 uint32_t g_lastTimeSave   = 0;   // Backup 6 giờ/lần
 uint32_t g_lastVccCheck   = 0;
-uint32_t g_lastWifiCheck  = 0;
+uint32_t g_wifiCycleAt    = 0;   // Thời điểm bắt đầu phase hiện tại (on/off)
 bool     g_wateredThisCycle = false;
 
 // ── Thời gian ─────────────────────────────────────────────────────────────────
@@ -713,13 +714,26 @@ void loop() {
     }
   }
 
-  // 3. Bật/tắt WiFi theo khung giờ 8:00–16:00
-  if (now_ms - g_lastWifiCheck >= WIFI_CHECK_MS) {
-    g_lastWifiCheck = now_ms;
-    if (isApWindow()) {
+  // 3. WiFi duty cycle: 1 phút bật / 5 phút tắt, chỉ trong 8:00–16:00
+  if (!isApWindow()) {
+    // Ngoài khung giờ → tắt hẳn
+    if (g_wifiActive) { wifiOff(); g_wifiCycleAt = now_ms; }
+  } else if (!g_wifiActive) {
+    // Đang tắt → bật sau WIFI_OFF_MS
+    if (now_ms - g_wifiCycleAt >= WIFI_OFF_MS) {
       wifiOn();
-    } else {
-      wifiOff();
+      g_wifiCycleAt = now_ms;
+    }
+  } else {
+    // Đang bật → sau WIFI_ON_MS kiểm tra có client không
+    if (now_ms - g_wifiCycleAt >= WIFI_ON_MS) {
+      bool hasClient = g_apMode ? (WiFi.softAPgetStationNum() > 0) : false;
+      if (hasClient) {
+        g_wifiCycleAt = now_ms;   // Gia hạn thêm 1 phút
+      } else {
+        wifiOff();
+        g_wifiCycleAt = now_ms;
+      }
     }
   }
 
