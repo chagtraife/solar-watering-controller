@@ -3,19 +3,15 @@
  *
  * Wiring:
  *   D0 (GPIO16) → Relay IN (active-HIGH) → Van điện từ
- *   A0 để trống (dùng đo Vcc nội bộ để phát hiện mất điện)
+ *   D5 (GPIO14) → Button (active-LOW, pull-up nội)
  *
- * WiFi:  Boot lần đầu (chưa có SSID) → AP "SolarWater-XXXX" / 192.168.4.1
- *        Đã cấu hình SSID → thử kết nối STA, retry mỗi 5 phút
+ * WiFi:  Nhấn giữ nút GPIO14 5 giây → bật AP "SolarWater-XXXX" / 192.168.4.1
+ *        Sau 60s không có ai kết nối → tắt AP tự động
  * Time:  User tự set giờ qua Web UI (không cần internet)
- *        Lưu EEPROM khi Vcc sụt + backup mỗi 6 giờ
  *
  * Board: Generic ESP8266 Module
  * Core:  ESP8266 Arduino Core (Board Manager)
  */
-
-// Đặt trước mọi #include — chuyển ADC sang đo Vcc nội bộ (A0 để trống)
-ADC_MODE(ADC_VCC);
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
@@ -24,38 +20,27 @@ ADC_MODE(ADC_VCC);
 
 // ── Pin ───────────────────────────────────────────────────────────────────────
 #define VALVE_PIN  16   // GPIO16 = D0, active-HIGH relay
+#define BTN_PIN    14   // GPIO14 = D5, active-LOW, pull-up nội
 
 // ── EEPROM ────────────────────────────────────────────────────────────────────
 #define EEPROM_SIZE  256
 #define ADDR_MAGIC     0   // 1 byte
-#define ADDR_SSID      1   // 64 bytes
-#define ADDR_PASS     65   // 64 bytes
-#define ADDR_TZ      129   // 1 byte (int8_t)
+#define ADDR_TZ      129   // 1 byte (int8_t) — giữ nguyên địa chỉ cũ
 #define ADDR_SCHED   130   // sizeof(Schedule)
-#define ADDR_TIME    160   // 4 bytes — Unix timestamp checkpoint
 #define MAGIC_VAL   0xC7
 
 // ── Hằng số ───────────────────────────────────────────────────────────────────
 #define AP_PREFIX        "SolarWater"
 #define AP_PASSWORD      "12345678"
 
-#define AP_TX_POWER      0     // 0dBm — tầm phủ ~1-2m khi setup lần đầu
-#define AP_BEACON_MS   500     // beacon interval AP (ms)
+#define AP_TX_POWER      0     // 0dBm — tầm phủ ~1-2m khi setup
+#define AP_BEACON_MS   500
 
-#define WIFI_TIMEOUT_MS  30000UL
-#define WIFI_RETRY_MS    (5UL * 60 * 1000)    // Thử kết nối STA mỗi 5 phút
+#define BTN_HOLD_MS   5000UL   // Giữ nút 5s để bật AP
+#define AP_IDLE_MS   60000UL   // Tắt AP sau 60s không có client
 
-// IP tĩnh khi kết nối hotspot — đổi theo subnet thực tế (xem Serial lúc DHCP)
-static const IPAddress STA_IP     ( 10, 143, 117, 200);
-static const IPAddress STA_GW     ( 10, 143, 117,   1);
-static const IPAddress STA_SUBNET (255, 255, 255,   0);
 #define SCHED_CHECK_MS   10000UL               // Kiểm tra lịch mỗi 10 giây
 #define SCHED_WINDOW_SEC   60                  // Tưới khi sai lệch ≤60s
-
-// ── Phát hiện mất điện qua Vcc ───────────────────────────────────────────────
-#define VCC_CHECK_MS     1000UL    // Đo Vcc mỗi 1 giây
-#define VCC_LOW_MV       2700      // Ngưỡng "điện sụt" (mV) — lưu EEPROM ngay
-#define TIME_BACKUP_MS   (6UL * 3600 * 1000)  // Backup định kỳ mỗi 6 giờ
 
 // ── Cấu trúc lịch tưới ───────────────────────────────────────────────────────
 struct Schedule {
@@ -68,8 +53,6 @@ struct Schedule {
 };
 
 // ── Biến toàn cục ─────────────────────────────────────────────────────────────
-char     g_ssid[64];
-char     g_pass[64];
 int8_t   g_tz   = 7;
 Schedule g_sched;
 
@@ -80,18 +63,20 @@ bool     g_apMode     = false;
 bool     g_watering   = false;
 uint32_t g_waterEnd   = 0;
 
-uint32_t g_lastCheck      = 0;
-uint32_t g_lastTimeSave   = 0;   // Backup 6 giờ/lần
-uint32_t g_lastVccCheck   = 0;
-uint32_t g_wifiCycleAt    = 0;   // Thời điểm bắt đầu phase hiện tại (on/off)
-uint32_t g_reconnectAt    = 0;   // Thời điểm bắt đầu reconnect (0 = không reconnect)
+uint32_t g_lastCheck        = 0;
 bool     g_wateredThisCycle = false;
+
+// Nút bấm
+uint32_t g_btnPressedAt = 0;       // millis() lúc nhấn; 0 = không nhấn
+bool     g_btnTriggered = false;   // tránh trigger liên tục khi giữ
+
+// AP idle timeout
+uint32_t g_apIdleSince  = 0;       // millis() khi bắt đầu không có client; 0 = có client
 
 // ── Thời gian ─────────────────────────────────────────────────────────────────
 static time_t nowTs()    { return time(nullptr); }
 static bool   timeValid(){ return nowTs() > 1609459200UL; }
 
-// Áp dụng múi giờ (không kết nối NTP server)
 static void applyTimezone() {
   configTime((long)g_tz * 3600, 0, "", "");
 }
@@ -106,14 +91,10 @@ static String fmtTime(time_t t) {
 static void cfgLoad() {
   EEPROM.begin(EEPROM_SIZE);
   if (EEPROM.read(ADDR_MAGIC) != MAGIC_VAL) {
-    memset(g_ssid, 0, sizeof(g_ssid));
-    memset(g_pass, 0, sizeof(g_pass));
     g_tz    = 7;
     g_sched = {false, 6, 0, 300, 0, 0x7F};
     return;
   }
-  EEPROM.get(ADDR_SSID,  g_ssid);
-  EEPROM.get(ADDR_PASS,  g_pass);
   EEPROM.get(ADDR_TZ,    g_tz);
   EEPROM.get(ADDR_SCHED, g_sched);
 }
@@ -121,68 +102,15 @@ static void cfgLoad() {
 static void cfgSave() {
   EEPROM.begin(EEPROM_SIZE);
   EEPROM.write(ADDR_MAGIC, MAGIC_VAL);
-  EEPROM.put(ADDR_SSID,  g_ssid);
-  EEPROM.put(ADDR_PASS,  g_pass);
   EEPROM.put(ADDR_TZ,    g_tz);
   EEPROM.put(ADDR_SCHED, g_sched);
   EEPROM.commit();
-}
-
-// Lưu giờ hiện tại vào EEPROM (checkpoint để khôi phục sau mất điện)
-static void timeSave() {
-  if (!timeValid()) return;
-  static uint32_t lastSaved = 0;
-  time_t now = nowTs();
-
-  // Chỉ lưu khi khác ngày, giờ hoặc phút so với lần trước
-  if (lastSaved > 1609459200UL) {
-    struct tm tn = *localtime(&now);
-    time_t   ls  = (time_t)lastSaved;
-    struct tm tp = *localtime(&ls);
-    if (tn.tm_mday == tp.tm_mday &&
-        tn.tm_hour == tp.tm_hour &&
-        tn.tm_min  == tp.tm_min)  return;
-  }
-
-  lastSaved = (uint32_t)now;
-  EEPROM.begin(EEPROM_SIZE);
-  EEPROM.put(ADDR_TIME, lastSaved);
-  EEPROM.commit();
-}
-
-// Khôi phục giờ từ EEPROM khi boot; mặc định 10/05/2026 00:00 nếu chưa có
-static void timeLoad() {
-  EEPROM.begin(EEPROM_SIZE);
-  uint32_t ts;
-  EEPROM.get(ADDR_TIME, ts);
-  if (ts > 1609459200UL) {
-    timeval tv = {(time_t)ts, 0};
-    settimeofday(&tv, nullptr);
-  } else {
-    struct tm def = {};
-    def.tm_year = 2026 - 1900;
-    def.tm_mon  = 5 - 1;   // tháng 5
-    def.tm_mday = 10;
-    def.tm_isdst = -1;
-    timeval tv = {mktime(&def), 0};
-    settimeofday(&tv, nullptr);
-  }
 }
 
 // ── Lịch tưới ─────────────────────────────────────────────────────────────────
 static bool dayMatches(const struct tm &t) {
   if (g_sched.mode == 0) return true;
   return (g_sched.days >> t.tm_wday) & 1;
-}
-
-static bool wateringSoon() {
-  if (!g_sched.enabled || !timeValid() || g_watering) return g_watering;
-  time_t n = nowTs();
-  struct tm t = *localtime(&n);
-  int nowSec   = t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec;
-  int schedSec = g_sched.hour * 3600 + g_sched.minute * 60;
-  int diff     = schedSec - nowSec;
-  return diff >= 0 && diff <= (int)(WIFI_TIMEOUT_MS / 1000);
 }
 
 static bool isWateringTime() {
@@ -233,13 +161,13 @@ static void waterCheck() {
     g_watering = false;
     valveSet(false);
     g_wateredThisCycle = true;
-    timeSave();   // Lưu giờ ngay sau khi tưới xong
     Serial.println("[valve] Đóng");
   }
 }
 
 // ── WiFi ──────────────────────────────────────────────────────────────────────
 static void startAP() {
+  if (g_apMode) return;
   char apName[32];
   snprintf(apName, sizeof(apName), "%s-%04X", AP_PREFIX, (uint16_t)ESP.getChipId());
   WiFi.forceSleepWake();
@@ -251,45 +179,58 @@ static void startAP() {
   wifi_softap_get_config(&cfg);
   cfg.beacon_interval = AP_BEACON_MS;
   wifi_softap_set_config(&cfg);
-  g_wifiActive = true;
-  g_apMode     = true;
+  g_wifiActive  = true;
+  g_apMode      = true;
+  g_apIdleSince = millis() ? millis() : 1;   // bắt đầu đếm idle từ lúc mở AP
   g_srv.begin();
   Serial.printf("[wifi] AP: %s  IP: 192.168.4.1\n", apName);
-}
-
-static void staConnect() {
-  if (g_wifiActive || strlen(g_ssid) == 0) return;
-  Serial.printf("[wifi] Connecting to '%s'...\n", g_ssid);
-  WiFi.forceSleepWake();
-  delay(1);
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleepMode(WIFI_LIGHT_SLEEP);
-  WiFi.config(STA_IP, STA_GW, STA_SUBNET);
-  WiFi.begin(g_ssid, g_pass);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - t0 > WIFI_TIMEOUT_MS) {
-      Serial.printf("[wifi] STA failed (status=%d)\n", WiFi.status());
-      WiFi.disconnect(true);
-      WiFi.mode(WIFI_OFF);
-      return;
-    }
-    delay(250);
-  }
-  g_wifiActive = true;
-  g_apMode     = false;
-  g_srv.begin();
-  Serial.println("[wifi] STA: " + WiFi.localIP().toString());
 }
 
 static void wifiOff() {
   if (!g_wifiActive) return;
   g_srv.stop();
-  WiFi.disconnect(true);
-  WiFi.forceSleepBegin();   // CPU ngủ trong delay() khi idle → ~0.9mA
-  g_wifiActive = false;
-  g_apMode     = false;
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  WiFi.forceSleepBegin();
+  g_wifiActive  = false;
+  g_apMode      = false;
+  g_apIdleSince = 0;
   Serial.println("[wifi] Off");
+}
+
+// ── Nút bấm ───────────────────────────────────────────────────────────────────
+static void checkButton(uint32_t now_ms) {
+  bool pressed = (digitalRead(BTN_PIN) == LOW);
+  if (pressed) {
+    if (g_btnPressedAt == 0) {
+      g_btnPressedAt = now_ms ? now_ms : 1;
+      g_btnTriggered = false;
+    } else if (!g_btnTriggered && now_ms - g_btnPressedAt >= BTN_HOLD_MS) {
+      g_btnTriggered = true;
+      if (!g_apMode) {
+        Serial.println("[btn] Giữ 5s → bật AP");
+        startAP();
+      }
+    }
+  } else {
+    g_btnPressedAt = 0;
+    g_btnTriggered = false;
+  }
+}
+
+// ── AP idle timeout ───────────────────────────────────────────────────────────
+static void checkApTimeout(uint32_t now_ms) {
+  if (!g_apMode) return;
+  uint8_t clients = WiFi.softAPgetStationNum();
+  if (clients > 0) {
+    g_apIdleSince = 0;   // có client → reset idle timer
+  } else {
+    if (g_apIdleSince == 0) g_apIdleSince = now_ms ? now_ms : 1;
+    if (now_ms - g_apIdleSince >= AP_IDLE_MS) {
+      Serial.println("[wifi] AP: 60s không client → tắt");
+      wifiOff();
+    }
+  }
 }
 
 // ── Web UI ────────────────────────────────────────────────────────────────────
@@ -309,8 +250,7 @@ h1{color:#2e7d32;font-size:1.25em;margin-bottom:6px}
 .card{border:1px solid #ddd;border-radius:8px;padding:16px;margin-bottom:12px}
 .card h3{margin:0 0 10px;font-size:1em}
 label{display:block;margin-top:10px;font-weight:600;font-size:.88em;color:#555}
-input[type=text],input[type=password],input[type=number],
-input[type=date],input[type=time],select{
+input[type=number],input[type=date],input[type=time],select{
   width:100%;padding:8px;border:1px solid #bbb;border-radius:4px;margin-top:3px;font-size:.95em}
 .chk-row{display:flex;align-items:center;gap:8px;margin-top:10px}
 .chk-row input{width:auto}
@@ -375,15 +315,11 @@ input[type=date],input[type=time],select{
   </form>
 </div>
 
-<!-- WiFi + Timezone -->
+<!-- Cài đặt -->
 <form method="post" action="/save">
 <div class="card">
-  <h3>&#128225; Cài đặt WiFi</h3>
-  <label>Tên mạng (SSID)</label>
-  <input type="text" name="ssid" value="%SSID%" maxlength="63">
-  <label>Mật khẩu</label>
-  <input type="password" name="pass" maxlength="63" placeholder="Để trống = không đổi">
-  <label>Múi giờ UTC+</label>
+  <h3>&#127758; Múi giờ</h3>
+  <label>UTC+</label>
   <input type="number" name="tz" min="-12" max="14" value="%TZ%">
   <div class="hint">Việt Nam = 7</div>
 </div>
@@ -435,7 +371,6 @@ input[type=date],input[type=time],select{
 function toggleDays(v){
   document.getElementById('daysRow').style.display=v=='1'?'flex':'none';
 }
-// Đồng hồ khởi tạo từ giờ device (parse chuỗi dd/mm/yyyy HH:MM:SS)
 var clkEl=document.getElementById('clk');
 var y,mo,d,h,m,s;
 (function(){
@@ -465,7 +400,6 @@ static String buildPage() {
   String html = FPSTR(HTML);
   time_t n = nowTs();
 
-  // Cảnh báo nếu chưa set giờ
   html.replace("%WARN%", timeValid() ? "" :
     "<div class='warn'>&#9888; <b>Chưa có thời gian!</b> "
     "Vui lòng cập nhật giờ bên dưới để lịch tưới hoạt động.</div>");
@@ -490,12 +424,19 @@ static String buildPage() {
   if (g_apMode) {
     char apName[32];
     snprintf(apName, sizeof(apName), "%s-%04X", AP_PREFIX, (uint16_t)ESP.getChipId());
-    html.replace("%WIFI%", "AP — <b>" + String(apName) + "</b> / 192.168.4.1");
+    uint8_t clients = WiFi.softAPgetStationNum();
+    String wifiStr = "AP — <b>" + String(apName) + "</b> / 192.168.4.1";
+    if (clients == 0 && g_apIdleSince) {
+      uint32_t elapsed = (millis() - g_apIdleSince) / 1000;
+      uint32_t remain  = AP_IDLE_MS / 1000 - min(elapsed, AP_IDLE_MS / 1000);
+      wifiStr += " (tắt sau " + String(remain) + "s)";
+    }
+    html.replace("%WIFI%", wifiStr);
   } else {
-    html.replace("%WIFI%", "&#9989; <b>" + WiFi.localIP().toString() + "</b>");
+    html.replace("%WIFI%", "Tắt — giữ nút 5s để bật");
   }
 
-  // Pre-fill date/time inputs với giờ hiện tại
+  // Pre-fill date/time inputs
   if (timeValid()) {
     char dateBuf[12], timeBuf[6];
     struct tm *lt = localtime(&n);
@@ -508,8 +449,6 @@ static String buildPage() {
     html.replace("%CUR_TIME%", "06:00");
   }
 
-  // Form fields
-  html.replace("%SSID%",       String(g_ssid));
   html.replace("%TZ%",         String(g_tz));
   html.replace("%CHK_EN%",     g_sched.enabled   ? "checked" : "");
   html.replace("%SEL_DAILY%",  g_sched.mode == 0 ? "selected" : "");
@@ -531,7 +470,6 @@ static void handleSyncTime() {
     if (ts > 1609459200UL) {
       timeval tv = {ts, 0};
       settimeofday(&tv, nullptr);
-      timeSave();
       Serial.println("[time] Sync từ browser: " + fmtTime(nowTs()));
     }
   }
@@ -551,7 +489,6 @@ static void handleSetTime() {
   sscanf(dateStr.c_str(), "%d-%d-%d", &yr, &mo, &dy);
   sscanf(timeStr.c_str(), "%d:%d",    &hr, &mn);
 
-  // mktime() chuyển giờ địa phương (đã set bởi applyTimezone) → UTC
   struct tm t = {};
   t.tm_year  = yr - 1900;
   t.tm_mon   = mo - 1;
@@ -563,7 +500,6 @@ static void handleSetTime() {
 
   timeval tv = {utc, 0};
   settimeofday(&tv, nullptr);
-  timeSave();   // Lưu ngay vào EEPROM
 
   Serial.println("[time] Set: " + fmtTime(nowTs()));
   g_srv.sendHeader("Location", "/");
@@ -571,19 +507,6 @@ static void handleSetTime() {
 }
 
 static void handleSave() {
-  char newSsid[64] = {};
-  char newPass[64] = {};
-  if (g_srv.hasArg("ssid"))
-    strncpy(newSsid, g_srv.arg("ssid").c_str(), sizeof(newSsid) - 1);
-  if (g_srv.arg("pass").length() > 0)
-    strncpy(newPass, g_srv.arg("pass").c_str(), sizeof(newPass) - 1);
-
-  bool wifiChanged = (strcmp(newSsid, g_ssid) != 0)
-                  || (strlen(newPass) > 0 && strcmp(newPass, g_pass) != 0);
-
-  strncpy(g_ssid, newSsid, sizeof(g_ssid));
-  if (strlen(newPass) > 0) strncpy(g_pass, newPass, sizeof(g_pass));
-
   g_tz = (int8_t)constrain(g_srv.arg("tz").toInt(), -12, 14);
 
   g_sched.enabled     = g_srv.hasArg("enabled");
@@ -604,18 +527,8 @@ static void handleSave() {
   cfgSave();
   applyTimezone();
 
-  if (wifiChanged) {
-    g_srv.send(200, "text/html; charset=utf-8",
-      "<meta charset=UTF-8>"
-      "<p style='font-family:Arial;padding:20px;font-size:1.1em'>"
-      "&#10003; Đã lưu! Đang khởi động lại...</p>"
-      "<script>setTimeout(()=>location.href='/',3000)</script>");
-    delay(1500);
-    ESP.restart();
-  } else {
-    g_srv.sendHeader("Location", "/");
-    g_srv.send(302);
-  }
+  g_srv.sendHeader("Location", "/");
+  g_srv.send(302);
 }
 
 static void handleWater() {
@@ -659,58 +572,38 @@ void setup() {
   pinMode(VALVE_PIN, OUTPUT);
   valveSet(false);
 
-  cfgLoad();
-  applyTimezone();   // Set múi giờ (không cần internet)
-  timeLoad();        // Khôi phục giờ từ EEPROM checkpoint
+  pinMode(BTN_PIN, INPUT_PULLUP);
 
-  if (timeValid())
-    Serial.println("[time] Khôi phục: " + fmtTime(nowTs()));
-  else
-    Serial.println("[time] Chưa có giờ — cần set qua Web UI");
+  WiFi.mode(WIFI_OFF);
+  WiFi.forceSleepBegin();
+
+  cfgLoad();
+  applyTimezone();
+
+  Serial.println("[time] Chưa có giờ — cần set qua Web UI");
 
   g_srv.on("/",         HTTP_GET,  handleRoot);
   g_srv.on("/synctime", HTTP_GET,  handleSyncTime);
   g_srv.on("/settime",  HTTP_POST, handleSetTime);
-  g_srv.on("/save",    HTTP_POST, handleSave);
-  g_srv.on("/water",   HTTP_POST, handleWater);
-  g_srv.on("/stop",    HTTP_POST, handleStop);
-  g_srv.on("/reset",   HTTP_POST, handleReset);
+  g_srv.on("/save",     HTTP_POST, handleSave);
+  g_srv.on("/water",    HTTP_POST, handleWater);
+  g_srv.on("/stop",     HTTP_POST, handleStop);
+  g_srv.on("/reset",    HTTP_POST, handleReset);
   g_srv.onNotFound(handleNotFound);
 
-  // Lần đầu chưa có SSID → AP để cấu hình; đã có → thử STA ngay
-  if (strlen(g_ssid) == 0) {
-    startAP();
-  } else {
-    staConnect();
-  }
-  Serial.println("[boot] Ready");
+  Serial.println("[boot] Ready — giữ nút GPIO14 5s để bật AP");
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
-  if (g_wifiActive) g_srv.handleClient();
-  waterCheck();
-
   uint32_t now_ms = millis();
 
-  // 1a. Phát hiện mất điện qua Vcc — lưu EEPROM ngay khi điện sụt
-  if (timeValid() && now_ms - g_lastVccCheck >= VCC_CHECK_MS) {
-    g_lastVccCheck = now_ms;
-    uint16_t vcc = ESP.getVcc();
-    if (vcc < VCC_LOW_MV) {
-      timeSave();
-      Serial.printf("[power] Vcc thấp (%dmV) — đã lưu giờ!\n", vcc);
-    }
-  }
+  if (g_wifiActive) g_srv.handleClient();
+  waterCheck();
+  checkButton(now_ms);
+  checkApTimeout(now_ms);
 
-  // 1b. Backup định kỳ mỗi 6 giờ (phòng khi điện mất quá nhanh)
-  if (timeValid() && now_ms - g_lastTimeSave >= TIME_BACKUP_MS) {
-    g_lastTimeSave = now_ms;
-    timeSave();
-    Serial.println("[time] Backup: " + fmtTime(nowTs()));
-  }
-
-  // 2. Kiểm tra lịch tưới mỗi 10 giây
+  // Kiểm tra lịch tưới mỗi 10 giây
   if (now_ms - g_lastCheck >= SCHED_CHECK_MS) {
     g_lastCheck = now_ms;
 
@@ -722,27 +615,6 @@ void loop() {
         Serial.printf("[sched] Tưới %ds\n", g_sched.durationSec);
         waterStart(g_sched.durationSec);
       }
-    }
-  }
-
-  // 3. STA: giữ kết nối, reconnect ngay khi mất, retry mỗi 5 phút nếu fail
-  if (!g_apMode) {
-    if (g_wifiActive && WiFi.status() != WL_CONNECTED) {
-      if (g_reconnectAt == 0) {
-        g_reconnectAt = now_ms;
-        WiFi.reconnect();
-        Serial.println("[wifi] Lost, reconnecting...");
-      } else if (now_ms - g_reconnectAt >= WIFI_TIMEOUT_MS) {
-        g_reconnectAt = 0;
-        wifiOff();
-        g_wifiCycleAt = now_ms;
-        Serial.println("[wifi] Reconnect failed, retry in 5min");
-      }
-    } else if (g_wifiActive) {
-      g_reconnectAt = 0;
-    } else if (!wateringSoon() && now_ms - g_wifiCycleAt >= WIFI_RETRY_MS) {
-      staConnect();
-      g_wifiCycleAt = now_ms;
     }
   }
 
