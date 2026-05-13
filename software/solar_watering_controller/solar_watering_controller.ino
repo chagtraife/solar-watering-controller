@@ -3,30 +3,37 @@
  *
  * Wiring:
  *   D0 (GPIO16) → Relay IN (active-HIGH) → Van điện từ
+ *   D1 (GPIO5)  → DS1307 SCL
+ *   D2 (GPIO4)  → DS1307 SDA
  *   D5 (GPIO14) → Button (active-LOW, pull-up nội)
  *
  * WiFi:  Nhấn giữ nút GPIO14 5 giây → bật AP "SolarWater-XXXX" / 192.168.4.1
- *        Sau 60s không có ai kết nối → tắt AP tự động
- * Time:  User tự set giờ qua Web UI (không cần internet)
+ *        Sau 5 phút không có ai kết nối → tắt AP tự động
+ * Time:  DS1307 lưu giờ địa phương, đọc lúc boot; set qua Web UI → ghi DS1307
  *
  * Board: Generic ESP8266 Module
  * Core:  ESP8266 Arduino Core (Board Manager)
+ * Libs:  RTClib by Adafruit (Library Manager)
  */
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
+#include <Wire.h>
+#include <RTClib.h>
 #include <time.h>
 
 // ── Pin ───────────────────────────────────────────────────────────────────────
 #define VALVE_PIN  16   // GPIO16 = D0, active-HIGH relay
 #define BTN_PIN    14   // GPIO14 = D5, active-LOW, pull-up nội
 #define LED_PIN     2   // GPIO2  = D4, active-LOW, LED xanh ESP-12
+#define I2C_SDA     4   // GPIO4  = D2
+#define I2C_SCL     5   // GPIO5  = D1
 
 // ── EEPROM ────────────────────────────────────────────────────────────────────
 #define EEPROM_SIZE  256
 #define ADDR_MAGIC     0   // 1 byte
-#define ADDR_TZ      129   // 1 byte (int8_t) — giữ nguyên địa chỉ cũ
+#define ADDR_TZ      129   // 1 byte (int8_t)
 #define ADDR_SCHED   130   // sizeof(Schedule)
 #define MAGIC_VAL   0xC7
 
@@ -40,8 +47,10 @@
 #define BTN_HOLD_MS   5000UL   // Giữ nút 5s để bật AP
 #define AP_IDLE_MS  300000UL   // Tắt AP sau 5 phút không có client
 
-#define SCHED_CHECK_MS   10000UL               // Kiểm tra lịch mỗi 10 giây
-#define SCHED_WINDOW_SEC   60                  // Tưới khi sai lệch ≤60s
+#define SCHED_CHECK_MS   10000UL   // Kiểm tra lịch mỗi 10 giây
+#define SCHED_WINDOW_SEC   60      // Tưới khi sai lệch ≤60s
+
+#define RTC_SYNC_MS  3600000UL  // Đồng bộ lại từ DS1307 mỗi 1 giờ
 
 // ── Cấu trúc lịch tưới ───────────────────────────────────────────────────────
 struct Schedule {
@@ -57,6 +66,9 @@ struct Schedule {
 int8_t   g_tz   = 7;
 Schedule g_sched;
 
+RTC_DS1307 g_rtc;
+bool       g_rtcOk = false;
+
 ESP8266WebServer g_srv(80);
 
 bool     g_wifiActive = false;
@@ -68,11 +80,14 @@ uint32_t g_lastCheck        = 0;
 bool     g_wateredThisCycle = false;
 
 // Nút bấm
-uint32_t g_btnPressedAt = 0;       // millis() lúc nhấn; 0 = không nhấn
-bool     g_btnTriggered = false;   // tránh trigger liên tục khi giữ
+uint32_t g_btnPressedAt = 0;
+bool     g_btnTriggered = false;
 
 // AP idle timeout
-uint32_t g_apIdleSince  = 0;       // millis() khi bắt đầu không có client; 0 = có client
+uint32_t g_apIdleSince  = 0;
+
+// RTC re-sync
+uint32_t g_lastRtcSync  = 0;
 
 // ── Thời gian ─────────────────────────────────────────────────────────────────
 static time_t nowTs()    { return time(nullptr); }
@@ -86,6 +101,43 @@ static String fmtTime(time_t t) {
   char buf[24];
   strftime(buf, sizeof(buf), "%d/%m/%Y %H:%M:%S", localtime(&t));
   return String(buf);
+}
+
+// Đọc DS1307 → cập nhật đồng hồ hệ thống
+// DS1307 lưu giờ địa phương; mktime() chuyển về UTC dựa trên TZ đã cấu hình.
+static bool syncFromRTC() {
+  if (!g_rtcOk) return false;
+  DateTime dt = g_rtc.now();
+  if (dt.year() < 2020) return false;
+
+  struct tm t = {};
+  t.tm_year  = dt.year() - 1900;
+  t.tm_mon   = dt.month() - 1;
+  t.tm_mday  = dt.day();
+  t.tm_hour  = dt.hour();
+  t.tm_min   = dt.minute();
+  t.tm_sec   = dt.second();
+  t.tm_isdst = -1;
+  time_t utc = mktime(&t);
+
+  timeval tv = {utc, 0};
+  settimeofday(&tv, nullptr);
+  return true;
+}
+
+// Ghi giờ địa phương hiện tại vào DS1307
+static void syncToRTC() {
+  if (!g_rtcOk) return;
+  time_t n = nowTs();
+  struct tm *lt = localtime(&n);
+  g_rtc.adjust(DateTime(
+    lt->tm_year + 1900,
+    lt->tm_mon  + 1,
+    lt->tm_mday,
+    lt->tm_hour,
+    lt->tm_min,
+    lt->tm_sec
+  ));
 }
 
 // ── EEPROM ────────────────────────────────────────────────────────────────────
@@ -180,7 +232,7 @@ static void startAP() {
   wifi_softap_set_config(&cfg);
   g_wifiActive  = true;
   g_apMode      = true;
-  g_apIdleSince = 0;   // checkApTimeout() sẽ set sau khi AP ổn định
+  g_apIdleSince = 0;
   g_srv.begin();
   Serial.printf("[wifi] AP: %s  IP: 192.168.4.1\n", apName);
 }
@@ -221,20 +273,20 @@ static void checkApTimeout(uint32_t now_ms) {
   if (!g_apMode) return;
   uint8_t clients = WiFi.softAPgetStationNum();
   if (clients > 0) {
-    g_apIdleSince = 0;   // có client → reset idle timer
+    g_apIdleSince = 0;
   } else {
     if (g_apIdleSince == 0) g_apIdleSince = now_ms ? now_ms : 1;
     if (now_ms - g_apIdleSince >= AP_IDLE_MS) {
-      Serial.println("[wifi] AP: 60s không client → tắt");
+      Serial.println("[wifi] AP: 5 phút không client → tắt");
       wifiOff();
     }
   }
 }
 
 // ── LED ───────────────────────────────────────────────────────────────────────
-// AP mode : chớp 2 lần rồi nghỉ  (on200-off200-on200-off800, chu kỳ 1.4s)
+// AP mode    : chớp 2 lần rồi nghỉ (on200-off200-on200-off800, chu kỳ 1.4s)
 // Nút đang giữ : sáng liên tục
-// WiFi off    : tắt
+// WiFi off   : tắt
 static void updateLed(uint32_t now_ms) {
   bool on;
   if (g_apMode) {
@@ -283,6 +335,7 @@ input[type=number],input[type=date],input[type=time],select{
 .btn-reset{background:#b71c1c;color:#fff;font-size:.8em;padding:7px 12px}
 .hint{color:#888;font-size:.78em;margin-top:3px}
 .watering{color:#1b5e20;font-weight:700}
+.err{color:#c62828}
 @keyframes blink{50%{opacity:0}}
 .blink{animation:blink 1s step-end infinite}
 </style>
@@ -294,6 +347,7 @@ input[type=number],input[type=date],input[type=time],select{
 
 <div class="stat">
   <b>Thời gian:</b> <span id="clk">%TIME%</span><br>
+  <b>RTC DS1307:</b> %RTC%<br>
   <b>Van điện từ:</b> %VALVE%<br>
   <b>Tưới tiếp theo:</b> %NEXT%<br>
   <b>WiFi:</b> %WIFI%
@@ -418,6 +472,9 @@ static String buildPage() {
     "Vui lòng cập nhật giờ bên dưới để lịch tưới hoạt động.</div>");
 
   html.replace("%TIME%", timeValid() ? fmtTime(n) : "Đang đồng bộ...");
+  html.replace("%RTC%",  g_rtcOk
+    ? "<span style='color:#2e7d32'>Kết nối OK</span>"
+    : "<span class='err'>Không tìm thấy!</span>");
   html.replace("%NEXT%", nextWaterStr());
 
   // Valve status
@@ -483,6 +540,7 @@ static void handleSyncTime() {
     if (ts > 1609459200UL) {
       timeval tv = {ts, 0};
       settimeofday(&tv, nullptr);
+      syncToRTC();
       Serial.println("[time] Sync từ browser: " + fmtTime(nowTs()));
     }
   }
@@ -513,6 +571,7 @@ static void handleSetTime() {
 
   timeval tv = {utc, 0};
   settimeofday(&tv, nullptr);
+  syncToRTC();
 
   Serial.println("[time] Set: " + fmtTime(nowTs()));
   g_srv.sendHeader("Location", "/");
@@ -539,6 +598,8 @@ static void handleSave() {
 
   cfgSave();
   applyTimezone();
+  // DS1307 lưu giờ địa phương → cần ghi lại khi timezone thay đổi
+  syncToRTC();
 
   g_srv.sendHeader("Location", "/");
   g_srv.send(302);
@@ -594,9 +655,19 @@ void setup() {
   WiFi.mode(WIFI_OFF);
 
   cfgLoad();
-  applyTimezone();
+  applyTimezone();  // phải set TZ trước khi mktime() trong syncFromRTC
 
-  Serial.println("[time] Chưa có giờ — cần set qua Web UI");
+  Wire.begin(I2C_SDA, I2C_SCL);
+  g_rtcOk = g_rtc.begin();
+  if (g_rtcOk) {
+    if (syncFromRTC()) {
+      Serial.println("[rtc] Giờ từ DS1307: " + fmtTime(nowTs()));
+    } else {
+      Serial.println("[rtc] DS1307 chưa set giờ — cần set qua Web UI");
+    }
+  } else {
+    Serial.println("[rtc] Không tìm thấy DS1307 trên I2C!");
+  }
 
   g_srv.on("/",         HTTP_GET,  handleRoot);
   g_srv.on("/synctime", HTTP_GET,  handleSyncTime);
@@ -619,6 +690,12 @@ void loop() {
   checkButton(now_ms);
   checkApTimeout(now_ms);
   updateLed(now_ms);
+
+  // Đồng bộ lại từ DS1307 mỗi 1 giờ (bù trôi oscillator ESP8266)
+  if (now_ms - g_lastRtcSync >= RTC_SYNC_MS) {
+    g_lastRtcSync = now_ms;
+    syncFromRTC();
+  }
 
   // Kiểm tra lịch tưới mỗi 10 giây
   if (now_ms - g_lastCheck >= SCHED_CHECK_MS) {
