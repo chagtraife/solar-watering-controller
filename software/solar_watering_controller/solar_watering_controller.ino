@@ -145,7 +145,7 @@ static void cfgLoad() {
   EEPROM.begin(EEPROM_SIZE);
   if (EEPROM.read(ADDR_MAGIC) != MAGIC_VAL) {
     g_tz    = 7;
-    g_sched = {false, 6, 0, 300, 0, 0x7F};
+    g_sched = {true, 6, 0, 300, 0, 0x7F};
     return;
   }
   EEPROM.get(ADDR_TZ,    g_tz);
