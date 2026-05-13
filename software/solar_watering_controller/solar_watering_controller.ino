@@ -21,6 +21,7 @@
 // ── Pin ───────────────────────────────────────────────────────────────────────
 #define VALVE_PIN  16   // GPIO16 = D0, active-HIGH relay
 #define BTN_PIN    14   // GPIO14 = D5, active-LOW, pull-up nội
+#define LED_PIN     2   // GPIO2  = D4, active-LOW, LED xanh ESP-12
 
 // ── EEPROM ────────────────────────────────────────────────────────────────────
 #define EEPROM_SIZE  256
@@ -37,7 +38,7 @@
 #define AP_BEACON_MS   500
 
 #define BTN_HOLD_MS   5000UL   // Giữ nút 5s để bật AP
-#define AP_IDLE_MS   60000UL   // Tắt AP sau 60s không có client
+#define AP_IDLE_MS  300000UL   // Tắt AP sau 5 phút không có client
 
 #define SCHED_CHECK_MS   10000UL               // Kiểm tra lịch mỗi 10 giây
 #define SCHED_WINDOW_SEC   60                  // Tưới khi sai lệch ≤60s
@@ -170,8 +171,6 @@ static void startAP() {
   if (g_apMode) return;
   char apName[32];
   snprintf(apName, sizeof(apName), "%s-%04X", AP_PREFIX, (uint16_t)ESP.getChipId());
-  WiFi.forceSleepWake();
-  delay(1);
   WiFi.mode(WIFI_AP);
   WiFi.setOutputPower(AP_TX_POWER);
   WiFi.softAP(apName, AP_PASSWORD);
@@ -181,7 +180,7 @@ static void startAP() {
   wifi_softap_set_config(&cfg);
   g_wifiActive  = true;
   g_apMode      = true;
-  g_apIdleSince = millis() ? millis() : 1;   // bắt đầu đếm idle từ lúc mở AP
+  g_apIdleSince = 0;   // checkApTimeout() sẽ set sau khi AP ổn định
   g_srv.begin();
   Serial.printf("[wifi] AP: %s  IP: 192.168.4.1\n", apName);
 }
@@ -191,7 +190,6 @@ static void wifiOff() {
   g_srv.stop();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_OFF);
-  WiFi.forceSleepBegin();
   g_wifiActive  = false;
   g_apMode      = false;
   g_apIdleSince = 0;
@@ -231,6 +229,21 @@ static void checkApTimeout(uint32_t now_ms) {
       wifiOff();
     }
   }
+}
+
+// ── LED ───────────────────────────────────────────────────────────────────────
+// AP mode : chớp 2 lần rồi nghỉ  (on200-off200-on200-off800, chu kỳ 1.4s)
+// Nút đang giữ : sáng liên tục
+// WiFi off    : tắt
+static void updateLed(uint32_t now_ms) {
+  bool on;
+  if (g_apMode) {
+    uint32_t t = now_ms % 1400;
+    on = (t < 200) || (t >= 400 && t < 600);
+  } else {
+    on = (g_btnPressedAt != 0);
+  }
+  digitalWrite(LED_PIN, on ? LOW : HIGH);
 }
 
 // ── Web UI ────────────────────────────────────────────────────────────────────
@@ -428,7 +441,7 @@ static String buildPage() {
     String wifiStr = "AP — <b>" + String(apName) + "</b> / 192.168.4.1";
     if (clients == 0 && g_apIdleSince) {
       uint32_t elapsed = (millis() - g_apIdleSince) / 1000;
-      uint32_t remain  = AP_IDLE_MS / 1000 - min(elapsed, AP_IDLE_MS / 1000);
+      uint32_t remain  = elapsed < AP_IDLE_MS / 1000 ? AP_IDLE_MS / 1000 - elapsed : 0;
       wifiStr += " (tắt sau " + String(remain) + "s)";
     }
     html.replace("%WIFI%", wifiStr);
@@ -572,10 +585,13 @@ void setup() {
   pinMode(VALVE_PIN, OUTPUT);
   valveSet(false);
 
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);  // tắt LED lúc boot
+
   pinMode(BTN_PIN, INPUT_PULLUP);
 
+  WiFi.persistent(false);
   WiFi.mode(WIFI_OFF);
-  WiFi.forceSleepBegin();
 
   cfgLoad();
   applyTimezone();
@@ -602,6 +618,7 @@ void loop() {
   waterCheck();
   checkButton(now_ms);
   checkApTimeout(now_ms);
+  updateLed(now_ms);
 
   // Kiểm tra lịch tưới mỗi 10 giây
   if (now_ms - g_lastCheck >= SCHED_CHECK_MS) {
