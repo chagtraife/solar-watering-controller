@@ -2,10 +2,11 @@
  * Solar Watering Controller - ESP8266 (ESP-12 Module)
  *
  * Wiring:
- *   D0 (GPIO16) → Relay IN (active-HIGH) → Van điện từ
+ *   D8 (GPIO15) → Relay IN (active-HIGH) → Van điện từ  (GPIO15 pull-down khi boot → relay luôn OFF)
  *   D1 (GPIO5)  → DS1307 SCL
  *   D2 (GPIO4)  → DS1307 SDA
  *   D5 (GPIO14) → Button (active-LOW, pull-up nội)
+ *   D0 (GPIO16) → RST (wake từ deep sleep)
  *
  * WiFi:  Nhấn giữ nút GPIO14 5 giây → bật AP "SolarWater-XXXX" / 192.168.4.1
  *        Sau 5 phút không có ai kết nối → tắt AP tự động
@@ -24,7 +25,7 @@
 #include <time.h>
 
 // ── Pin ───────────────────────────────────────────────────────────────────────
-#define VALVE_PIN  16   // GPIO16 = D0, active-HIGH relay
+#define VALVE_PIN  15   // GPIO15 = D8, active-HIGH relay, pull-down khi boot
 #define BTN_PIN    14   // GPIO14 = D5, active-LOW, pull-up nội
 #define LED_PIN     2   // GPIO2  = D4, active-LOW, LED xanh ESP-12
 #define I2C_SDA     4   // GPIO4  = D2
@@ -47,7 +48,6 @@
 #define BTN_HOLD_MS   5000UL   // Giữ nút 5s để bật AP
 #define AP_IDLE_MS  300000UL   // Tắt AP sau 5 phút không có client
 
-#define SCHED_CHECK_MS   10000UL   // Kiểm tra lịch mỗi 10 giây
 #define SCHED_WINDOW_SEC   60      // Tưới khi sai lệch ≤60s
 
 #define RTC_SYNC_MS  3600000UL  // Đồng bộ lại từ DS1307 mỗi 1 giờ
@@ -76,7 +76,6 @@ bool     g_apMode     = false;
 bool     g_watering   = false;
 uint32_t g_waterEnd   = 0;
 
-uint32_t g_lastCheck        = 0;
 bool     g_wateredThisCycle = false;
 
 // Nút bấm
@@ -615,6 +614,7 @@ static void handleStop() {
   if (g_watering) {
     g_watering = false;
     valveSet(false);
+    g_wateredThisCycle = true;
     Serial.println("[valve] Dừng thủ công");
   }
   g_srv.sendHeader("Location", "/");
@@ -678,7 +678,21 @@ void setup() {
   g_srv.on("/reset",    HTTP_POST, handleReset);
   g_srv.onNotFound(handleNotFound);
 
-  Serial.println("[boot] Ready — giữ nút GPIO14 5s để bật AP");
+  // Nút đang giữ khi boot → ở lại để xử lý AP mode trong loop()
+  if (digitalRead(BTN_PIN) == LOW) {
+    Serial.println("[boot] Nút giữ → chờ AP");
+    return;
+  }
+
+  // Đến giờ tưới → ở lại để tưới trong loop(), force check ngay lập tức
+  if (g_sched.enabled && isWateringTime()) {
+    Serial.println("[boot] Đến giờ tưới");
+    return;
+  }
+
+  // Không có gì làm → ngủ 5s rồi check lại
+  Serial.flush();
+  ESP.deepSleep(5000000ULL);
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
@@ -697,19 +711,23 @@ void loop() {
     syncFromRTC();
   }
 
-  // Kiểm tra lịch tưới mỗi 10 giây
-  if (now_ms - g_lastCheck >= SCHED_CHECK_MS) {
-    g_lastCheck = now_ms;
+  if (g_wateredThisCycle && !isWateringTime())
+    g_wateredThisCycle = false;
 
-    if (g_wateredThisCycle && !isWateringTime())
-      g_wateredThisCycle = false;
+  if (g_sched.enabled && !g_watering && !g_wateredThisCycle && isWateringTime()) {
+    Serial.printf("[sched] Tưới %ds\n", g_sched.durationSec);
+    waterStart(g_sched.durationSec);
+  }
 
-    if (g_sched.enabled && !g_watering && !g_wateredThisCycle) {
-      if (isWateringTime()) {
-        Serial.printf("[sched] Tưới %ds\n", g_sched.durationSec);
-        waterStart(g_sched.durationSec);
-      }
-    }
+  // Không còn việc → ngủ 5s để check nút lần wake tiếp.
+  // Giữ thức khi isWateringTime() để tưới xong trước, hoặc chờ hết cửa sổ
+  // trước khi ngủ (tránh tưới lại khi duration < SCHED_WINDOW_SEC).
+  if (!g_apMode && !g_watering && g_btnPressedAt == 0 && !isWateringTime()) {
+    Serial.flush();
+    delay(50);
+    valveSet(false);
+    digitalWrite(LED_PIN, HIGH);
+    ESP.deepSleep(5000000ULL);
   }
 
   delay(10);
